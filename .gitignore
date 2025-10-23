@@ -1,0 +1,5 @@
+*
+!branchExtractor/
+!src/
+!traces/
+!.gitignore
