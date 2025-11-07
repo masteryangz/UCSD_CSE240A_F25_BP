@@ -10,20 +10,20 @@
 #include "predictor.h"
 
 // -------------------- Tournament predictor configuration --------------------
-#define T_LHT_BITS   10               // local history bits (1024 entries)
-#define T_LHT_ENTRIES (1 << T_LHT_BITS)
-#define T_LPT_ENTRIES (1 << T_LHT_BITS) // index by local history (10 bits -> 1024)
-#define T_LPT_COUNTER_MAX 7           // 3-bit saturating (0..7)
-#define T_LPT_INIT 4                  // weakly taken (3-bit counter)
+#define T_LHT_BITS   20               // local history bits 
+#define T_LHT_ENTRIES (1UL << T_LHT_BITS) // 1024 entries
+#define T_LPT_ENTRIES (1UL << T_LHT_BITS) // index by local history 
+#define T_LPT_COUNTER_MAX 7           // 3-bit saturating counter
+#define T_LPT_INIT 0
 
-#define T_GHR_BITS   12               // global history bits
-#define T_GPT_ENTRIES (1 << T_GHR_BITS) // 4096 entries
-#define T_GPT_COUNTER_MAX 3           // 2-bit saturating (0..3)
-#define T_GPT_INIT 2                  // weakly taken (2-bit counter)
+#define T_GHR_BITS   24               // global history bits
+#define T_GPT_ENTRIES (1UL << T_GHR_BITS) // 4096 entries
+#define T_GPT_COUNTER_MAX 3           // 2-bit saturating counter
+#define T_GPT_INIT 0
 
-#define T_CHOOSER_ENTRIES (1 << T_GHR_BITS) // 4096 entries
-#define T_CHOOSER_MAX 3
-#define T_CHOOSER_INIT 1              // bias slightly toward local (1 = weakly prefer local)
+#define T_CHOOSER_ENTRIES (1UL << T_GHR_BITS) // 4096 entries
+#define T_CHOOSER_MAX 3           // 2-bit saturating counter 
+#define T_CHOOSER_INIT 1              // bias slightly toward local
 #define INC_SAT8(x, max) if ((x) < (max)) (x)++
 #define DEC_SAT8(x, min) if ((x) > (min)) (x)--
 
@@ -53,11 +53,11 @@ int verbose;
 
 //
 // Tournament
-static uint16_t *t_localHistory;   // T_LHT_ENTRIES entries, each holds T_LHT_BITS bits
+static uint64_t *t_localHistory;   // T_LHT_ENTRIES entries, each holds T_LHT_BITS bits
 static uint8_t  *t_localPred;      // T_LPT_ENTRIES of 3-bit counters (stored in uint8_t)
 static uint8_t  *t_globalPred;     // T_GPT_ENTRIES of 2-bit counters
 static uint8_t  *t_chooser;        // T_CHOOSER_ENTRIES of 2-bit counters
-static uint32_t t_ghr = 0;         // global history (T_GHR_BITS low bits)
+static uint64_t t_ghr = 0;         // global history register
 //
 // gshare
 uint8_t *bht_gshare;
@@ -71,7 +71,7 @@ uint64_t ghistory;
 void init_tournament()
 {
   // allocate
-  t_localHistory = (uint16_t *)malloc(sizeof(uint16_t) * T_LHT_ENTRIES);
+  t_localHistory = (uint64_t *)malloc(sizeof(uint64_t) * T_LHT_ENTRIES);
   t_localPred    = (uint8_t  *)malloc(sizeof(uint8_t)  * T_LPT_ENTRIES);
   t_globalPred   = (uint8_t  *)malloc(sizeof(uint8_t)  * T_GPT_ENTRIES);
   t_chooser      = (uint8_t  *)malloc(sizeof(uint8_t)  * T_CHOOSER_ENTRIES);
@@ -82,7 +82,7 @@ void init_tournament()
   }
 
   // initialize
-  memset(t_localHistory, 0, sizeof(uint16_t) * T_LHT_ENTRIES);
+  memset(t_localHistory, 0, sizeof(uint64_t) * T_LHT_ENTRIES);
   for (int i = 0; i < T_LPT_ENTRIES; ++i) t_localPred[i]  = T_LPT_INIT;
   for (int i = 0; i < T_GPT_ENTRIES; ++i) t_globalPred[i] = T_GPT_INIT;
   for (int i = 0; i < T_CHOOSER_ENTRIES; ++i) t_chooser[i]  = T_CHOOSER_INIT;
@@ -92,12 +92,12 @@ void init_tournament()
 
 uint8_t tournament_predict(uint32_t pc)
 {
-  // index into local history table using low bits of PC (similar to Alpha)
+  // index into local history table using low bits of PC 
   uint32_t lht_index = (pc >> 2) & (T_LHT_ENTRIES - 1);
-  uint32_t local_hist = t_localHistory[lht_index] & ((1 << T_LHT_BITS) - 1);
+  uint32_t local_hist = t_localHistory[lht_index];
 
   // local predictor indexed by local history
-  uint32_t local_index = local_hist & (T_LPT_ENTRIES - 1);
+  uint32_t local_index = local_hist & (T_LHT_ENTRIES - 1);
   uint8_t local_counter = t_localPred[local_index];
   uint8_t local_taken = (local_counter >= (T_LPT_COUNTER_MAX + 1) / 2); // >=4 taken
 
@@ -109,19 +109,29 @@ uint8_t tournament_predict(uint32_t pc)
   // chooser selects: smaller values prefer local, larger prefer global
   uint8_t chooser_val = t_chooser[global_index];
   uint8_t prefer_local = (chooser_val < 2); // 0/1 -> local, 2/3 -> global
-
+  static uint32_t branch_count = 0;
+  /*if (branch_count < 100) {
+    printf("PC=0x%x chooser[%d]=%d prefer_%s local_taken=%d global_taken=%d, local_counter=%d, global_counter=%d\n",
+          pc, global_index, chooser_val,
+          prefer_local ? "local" : "global",
+          local_taken, global_taken, local_counter, global_counter);
+  }*/
+  branch_count++;
   return prefer_local ? (local_taken ? TAKEN : NOTTAKEN) : (global_taken ? TAKEN : NOTTAKEN);
 }
 
 void train_tournament(uint32_t pc, uint8_t outcome)
 {
+  static uint32_t branch_count = 0;
+
   // outcome: TAKEN (1) or NOTTAKEN (0)
-  uint8_t taken = (outcome == TAKEN) ? 1 : 0;
+  uint8_t taken = outcome == TAKEN;
 
   // local indexes
   uint32_t lht_index = (pc >> 2) & (T_LHT_ENTRIES - 1);
-  uint32_t local_hist = t_localHistory[lht_index] & ((1 << T_LHT_BITS) - 1);
-  uint32_t local_index = local_hist & (T_LPT_ENTRIES - 1);
+  uint32_t local_hist = t_localHistory[lht_index];
+  //printf("PC=0x%x local_hist=0x%x", pc, local_hist);
+  uint32_t local_index = local_hist & (T_LHT_ENTRIES - 1);
 
   // global indexes
   uint32_t global_index = t_ghr & (T_GPT_ENTRIES - 1);
@@ -152,12 +162,19 @@ void train_tournament(uint32_t pc, uint8_t outcome)
       DEC_SAT8(t_chooser[global_index], 0);
     }
   }
-
+  if (branch_count < 100) {
+    /*printf("PC=0x%x outcome=%d localPred[%d]=%d globalPred[%d]=%d chooser[%d]=%d, localHistory[%d]=%d\n",
+         pc, outcome, local_index, t_localPred[local_index],
+         global_index, t_globalPred[global_index],
+         global_index, t_chooser[global_index], lht_index, t_localHistory[lht_index]);
+         */
+  }
+  branch_count++;
   // update local history (per-PC)
-  t_localHistory[lht_index] = ((t_localHistory[lht_index] << 1) | taken) & ((1 << T_LHT_BITS) - 1);
+  t_localHistory[lht_index] = ((t_localHistory[lht_index] << 1) | taken) & (T_LHT_ENTRIES - 1);
 
   // update global history
-  t_ghr = ((t_ghr << 1) | taken) & ((1 << T_GHR_BITS) - 1);
+  t_ghr = ((t_ghr << 1) | taken) & (T_GPT_ENTRIES - 1);
 }
 
 void cleanup_tournament()
