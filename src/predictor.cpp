@@ -10,20 +10,20 @@
 #include "predictor.h"
 
 // -------------------- Tournament predictor configuration --------------------
-#define T_LHT_BITS   20               // local history bits 
+#define T_LHT_BITS   11               // local history bits 
 #define T_LHT_ENTRIES (1UL << T_LHT_BITS) // 1024 entries
 #define T_LPT_ENTRIES (1UL << T_LHT_BITS) // index by local history 
 #define T_LPT_COUNTER_MAX 7           // 3-bit saturating counter
 #define T_LPT_INIT 0
 
-#define T_GHR_BITS   24               // global history bits
+#define T_GHR_BITS   13               // global history bits
 #define T_GPT_ENTRIES (1UL << T_GHR_BITS) // 4096 entries
 #define T_GPT_COUNTER_MAX 3           // 2-bit saturating counter
 #define T_GPT_INIT 0
 
 #define T_CHOOSER_ENTRIES (1UL << T_GHR_BITS) // 4096 entries
 #define T_CHOOSER_MAX 3           // 2-bit saturating counter 
-#define T_CHOOSER_INIT 1              // bias slightly toward local
+#define T_CHOOSER_INIT 2              // bias slightly toward global
 #define INC_SAT8(x, max) if ((x) < (max)) (x)++
 #define DEC_SAT8(x, min) if ((x) > (min)) (x)--
 
@@ -97,7 +97,7 @@ uint8_t tournament_predict(uint32_t pc)
   uint32_t local_hist = t_localHistory[lht_index];
 
   // local predictor indexed by local history
-  uint32_t local_index = local_hist & (T_LHT_ENTRIES - 1);
+  uint32_t local_index = local_hist & (T_LPT_ENTRIES - 1);
   uint8_t local_counter = t_localPred[local_index];
   uint8_t local_taken = (local_counter >= (T_LPT_COUNTER_MAX + 1) / 2); // >=4 taken
 
@@ -131,7 +131,7 @@ void train_tournament(uint32_t pc, uint8_t outcome)
   uint32_t lht_index = (pc >> 2) & (T_LHT_ENTRIES - 1);
   uint32_t local_hist = t_localHistory[lht_index];
   //printf("PC=0x%x local_hist=0x%x", pc, local_hist);
-  uint32_t local_index = local_hist & (T_LHT_ENTRIES - 1);
+  uint32_t local_index = local_hist & (T_LPT_ENTRIES - 1);
 
   // global indexes
   uint32_t global_index = t_ghr & (T_GPT_ENTRIES - 1);
