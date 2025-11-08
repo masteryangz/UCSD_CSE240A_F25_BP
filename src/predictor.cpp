@@ -11,21 +11,19 @@
 
 // -------------------- Tournament predictor configuration --------------------
 #define T_LHT_BITS   11               // local history bits 
-#define T_LHT_ENTRIES (1UL << T_LHT_BITS) // 1024 entries
+#define T_LHT_ENTRIES (1UL << T_LHT_BITS) 
 #define T_LPT_ENTRIES (1UL << T_LHT_BITS) // index by local history 
 #define T_LPT_COUNTER_MAX 7           // 3-bit saturating counter
-#define T_LPT_INIT 0
+#define T_LPT_INIT 1
 
 #define T_GHR_BITS   13               // global history bits
-#define T_GPT_ENTRIES (1UL << T_GHR_BITS) // 4096 entries
+#define T_GPT_ENTRIES (1UL << T_GHR_BITS) 
 #define T_GPT_COUNTER_MAX 3           // 2-bit saturating counter
-#define T_GPT_INIT 0
+#define T_GPT_INIT 1
 
-#define T_CHOOSER_ENTRIES (1UL << T_GHR_BITS) // 4096 entries
+#define T_CHOOSER_ENTRIES (1UL << T_GHR_BITS) 
 #define T_CHOOSER_MAX 3           // 2-bit saturating counter 
-#define T_CHOOSER_INIT 2              // bias slightly toward global
-#define INC_SAT8(x, max) if ((x) < (max)) (x)++
-#define DEC_SAT8(x, min) if ((x) > (min)) (x)--
+#define T_CHOOSER_INIT 1
 
 //
 // TODO:Student Information
@@ -67,6 +65,108 @@ uint64_t ghistory;
 //        Predictor Functions         //
 //------------------------------------//
 
+// Helpfer macros
+// Prediction
+#define PREDICT2b(counter, pred)   switch (counter) \
+  { \
+  case WN: \
+    pred = NOTTAKEN; \
+    break; \
+  case SN: \
+    pred = NOTTAKEN; \
+    break; \
+  case WT: \
+    pred = TAKEN; \
+  case ST: \
+    pred = TAKEN; \
+    break; \
+  default: \
+    printf("Warning: Undefined state of entry in 2 bit BHT!\n"); \
+    pred = NOTTAKEN; \
+    break; \
+  }
+
+#define PREDICT3b(counter, pred)   switch (counter) \
+  { \
+  case SSSN: \
+    pred = NOTTAKEN; \
+    break; \
+  case SSN: \
+    pred = NOTTAKEN; \
+    break; \
+  case NS: \
+    pred = NOTTAKEN; \
+    break; \
+  case NW: \
+    pred = TAKEN; \
+    break; \
+  case TW: \
+    pred = TAKEN; \
+    break; \
+  case TS: \
+    pred = TAKEN; \
+    break; \
+  case SST: \
+    pred = TAKEN; \
+    break; \
+  case SSST: \
+    pred = TAKEN; \
+    break; \
+  default: \
+    printf("Warning: Undefined state of entry in 3 bit BHT!\n"); \
+    pred = NOTTAKEN; \
+    break; \
+  }
+
+#define COUNTERUPDATE2b(counter, outcome)  switch (counter) \
+  { \
+  case WN: \
+    counter = (outcome == TAKEN) ? WT : SN; \
+    break; \
+  case SN: \
+    counter = (outcome == TAKEN) ? WN : SN; \
+    break; \
+  case WT: \
+    counter = (outcome == TAKEN) ? ST : WN; \
+    break; \
+  case ST: \
+    counter = (outcome == TAKEN) ? ST : WT; \
+    break; \
+  default: \
+    printf("Warning: Undefined state of entry in 2 bit BHT!\n"); \
+    break; \
+  }
+
+#define COUNTERUPDATE3b(counter, outcome)  switch (counter) \
+  { \
+  case SSSN: \
+    counter = (outcome == TAKEN) ? SSN : SSSN; \
+    break; \
+  case SSN: \
+    counter = (outcome == TAKEN) ? NS : SSSN; \
+    break; \
+  case NS: \
+    counter = (outcome == TAKEN) ? NW : SSN; \
+    break; \
+  case NW: \
+    counter = (outcome == TAKEN) ? TW : NS; \
+    break; \
+  case TW: \
+    counter = (outcome == TAKEN) ? TS : NW; \
+    break; \
+  case TS: \
+    counter = (outcome == TAKEN) ? SST : TW; \
+    break; \
+  case SST: \
+    counter = (outcome == TAKEN) ? SSST : TS; \
+    break; \
+  case SSST: \
+    counter = (outcome == TAKEN) ? SSST : SST; \
+    break; \
+  default: \
+    printf("Warning: Undefined state of entry in 3 bit BHT!\n"); \
+    break; \
+  }
 // Tournament functions
 void init_tournament()
 {
@@ -93,88 +193,62 @@ void init_tournament()
 uint8_t tournament_predict(uint32_t pc)
 {
   // index into local history table using low bits of PC 
-  uint32_t lht_index = (pc >> 2) & (T_LHT_ENTRIES - 1);
+  uint32_t lht_index = pc & (T_LHT_ENTRIES - 1);
   uint32_t local_hist = t_localHistory[lht_index];
 
   // local predictor indexed by local history
   uint32_t local_index = local_hist & (T_LPT_ENTRIES - 1);
   uint8_t local_counter = t_localPred[local_index];
-  uint8_t local_taken = (local_counter >= (T_LPT_COUNTER_MAX + 1) / 2); // >=4 taken
+  uint8_t local_taken;
+  PREDICT3b(local_counter, local_taken);
 
   // global predictor indexed by GHR
   uint32_t global_index = t_ghr & (T_GPT_ENTRIES - 1);
   uint8_t global_counter = t_globalPred[global_index];
-  uint8_t global_taken = (global_counter >= (T_GPT_COUNTER_MAX + 1) / 2); // >=2 taken
+  uint8_t global_taken;
+  PREDICT2b(global_counter, global_taken);
 
   // chooser selects: smaller values prefer local, larger prefer global
   uint8_t chooser_val = t_chooser[global_index];
-  uint8_t prefer_local = (chooser_val < 2); // 0/1 -> local, 2/3 -> global
-  static uint32_t branch_count = 0;
-  /*if (branch_count < 100) {
-    printf("PC=0x%x chooser[%d]=%d prefer_%s local_taken=%d global_taken=%d, local_counter=%d, global_counter=%d\n",
-          pc, global_index, chooser_val,
-          prefer_local ? "local" : "global",
-          local_taken, global_taken, local_counter, global_counter);
-  }*/
-  branch_count++;
-  return prefer_local ? (local_taken ? TAKEN : NOTTAKEN) : (global_taken ? TAKEN : NOTTAKEN);
+  uint8_t prefer_global;
+  PREDICT2b(chooser_val, prefer_global);
+  return prefer_global ? global_taken : local_taken;
 }
 
 void train_tournament(uint32_t pc, uint8_t outcome)
 {
-  static uint32_t branch_count = 0;
-
-  // outcome: TAKEN (1) or NOTTAKEN (0)
-  uint8_t taken = outcome == TAKEN;
-
   // local indexes
-  uint32_t lht_index = (pc >> 2) & (T_LHT_ENTRIES - 1);
+  uint32_t lht_index = pc & (T_LHT_ENTRIES - 1);
   uint32_t local_hist = t_localHistory[lht_index];
-  //printf("PC=0x%x local_hist=0x%x", pc, local_hist);
   uint32_t local_index = local_hist & (T_LPT_ENTRIES - 1);
 
   // global indexes
   uint32_t global_index = t_ghr & (T_GPT_ENTRIES - 1);
 
   // current predictions
-  uint8_t local_taken = (t_localPred[local_index] >= (T_LPT_COUNTER_MAX + 1) / 2);
-  uint8_t global_taken = (t_globalPred[global_index] >= (T_GPT_COUNTER_MAX + 1) / 2);
-
+  uint8_t local_taken;
+  PREDICT3b(t_localPred[local_index], local_taken);
+  uint8_t global_taken;
+  PREDICT2b(t_globalPred[global_index], global_taken);
   // update local predictor (3-bit saturating)
-  if (taken)
-    INC_SAT8(t_localPred[local_index], T_LPT_COUNTER_MAX);
-  else
-    DEC_SAT8(t_localPred[local_index], 0);
-
+  COUNTERUPDATE3b(t_localPred[local_index], outcome);
   // update global predictor (2-bit saturating)
-  if (taken)
-    INC_SAT8(t_globalPred[global_index], T_GPT_COUNTER_MAX);
-  else
-    DEC_SAT8(t_globalPred[global_index], 0);
-
+  COUNTERUPDATE2b(t_globalPred[global_index], outcome);
   // update chooser only when local and global disagree
   if (local_taken != global_taken) {
     // if global was correct, move chooser towards global (increment)
-    if (global_taken == taken) {
-      INC_SAT8(t_chooser[global_index], T_CHOOSER_MAX);
-    } else if (local_taken == taken) {
+    if (global_taken == outcome) {
+      COUNTERUPDATE2b(t_chooser[global_index], TAKEN);
+    } else if (local_taken == outcome) {
       // if local was correct, move chooser towards local (decrement)
-      DEC_SAT8(t_chooser[global_index], 0);
+      COUNTERUPDATE2b(t_chooser[global_index], NOTTAKEN);
     }
   }
-  if (branch_count < 100) {
-    /*printf("PC=0x%x outcome=%d localPred[%d]=%d globalPred[%d]=%d chooser[%d]=%d, localHistory[%d]=%d\n",
-         pc, outcome, local_index, t_localPred[local_index],
-         global_index, t_globalPred[global_index],
-         global_index, t_chooser[global_index], lht_index, t_localHistory[lht_index]);
-         */
-  }
-  branch_count++;
   // update local history (per-PC)
-  t_localHistory[lht_index] = ((t_localHistory[lht_index] << 1) | taken) & (T_LHT_ENTRIES - 1);
+  t_localHistory[lht_index] = ((t_localHistory[lht_index] << 1) | outcome) & (T_LHT_ENTRIES - 1);
 
   // update global history
-  t_ghr = ((t_ghr << 1) | taken) & (T_GPT_ENTRIES - 1);
+  t_ghr = ((t_ghr << 1) | outcome) & (T_GPT_ENTRIES - 1);
 }
 
 void cleanup_tournament()

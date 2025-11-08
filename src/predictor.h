@@ -39,6 +39,15 @@ extern const char *bpName[];
 #define WT 2 // predict T, weak taken
 #define ST 3 // predict T, strong taken
 
+// Definitions for 3-bit counters
+#define SSSN 0 
+#define SSN 1 
+#define NS 2 
+#define NW 3 
+#define TW 4
+#define TS 5
+#define SST 6
+#define SSST 7
 //------------------------------------//
 //      Predictor Configuration       //
 //------------------------------------//
