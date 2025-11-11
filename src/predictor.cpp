@@ -25,6 +25,18 @@
 #define T_CHOOSER_MAX 3           // 2-bit saturating counter 
 #define T_CHOOSER_INIT 1
 
+// -------------------- TAGE predictor configuration --------------------
+#define TAGE_BIMODAL_BITS 15                // bimodal size = 16K
+#define TAGE_BIMODAL_SIZE (1 << TAGE_BIMODAL_BITS)
+#define TAGE_NUM_TAGGED 7                   // number of tagged components
+#define TAGE_TAGGED_BITS 12                 // each table has 4K entries (4096)
+#define TAGE_TAGGED_SIZE (1 << TAGE_TAGGED_BITS)
+#define TAGE_TAG_BITS TAGE_TAGGED_BITS - 5
+#define TAGE_CTR_MAX 3                      // 3-bit signed-like counter: 0..7 used as saturating
+#define TAGE_CTR_INIT 4
+#define TAGE_U_MAX 3                        // useful counter 0..3
+#define TAGE_U_INIT 0
+
 //
 // TODO:Student Information
 //
@@ -60,6 +72,44 @@ static uint64_t t_ghr = 0;         // global history register
 // gshare
 uint8_t *bht_gshare;
 uint64_t ghistory;
+//
+// Custom
+// history lengths (geometric growth)
+//static const int tage_hist_lengths[TAGE_NUM_TAGGED] = {4, 10, 20, 60}; // example lengths
+static const int tage_hist_lengths[TAGE_NUM_TAGGED] = {4, 8, 16, 32, 64, 128, 256}; // lengths for 15-bit ghist
+
+// Data structures
+typedef struct {
+  uint16_t tag;    // truncated tag (TAG_BITS can be up to 16 here)
+  uint8_t ctr;     // prediction counter (3-bit using 0..7)
+  uint8_t u;       // useful counter (0..TAGE_U_MAX)
+} tage_entry_t;
+
+static uint8_t *tage_bimodal;                      // bimodal base table (2-bit counters)
+static tage_entry_t **tage_tables;                 // array of pointers to tagged tables
+static uint64_t tage_ghist = 0;                    // global history (kept wide)
+static int tage_hist_mask = 0;
+
+// helper: get lower N bits of history (we store ghist as bits LSB = most recent)
+static inline uint32_t get_hist_bits(uint64_t hist, int len) {
+  if (len >= 64) return (uint32_t)(hist & (~0ULL));
+  return (uint32_t)(hist & ((1ULL << len) - 1));
+}
+
+// index function: combine pc and history
+static inline uint32_t tage_index(uint32_t pc, uint64_t hist, int table) {
+  uint32_t h = get_hist_bits(hist, tage_hist_lengths[table]);
+  // simple mix: XOR pc shifted with history and table id
+  uint32_t idx = (pc ^ (h * 0x9e3779b9u) ^ (table * 0xabcdefu)) & (TAGE_TAGGED_SIZE - 1);
+  return idx;
+}
+
+// tag function: truncated tag
+static inline uint16_t tage_tag(uint32_t pc, uint64_t hist, int table) {
+  uint32_t h = get_hist_bits(hist, tage_hist_lengths[table]);
+  uint32_t tag = (pc ^ (h >> (table + 1))) & ((1u << TAGE_TAG_BITS) - 1);
+  return (uint16_t)tag;
+}
 
 //------------------------------------//
 //        Predictor Functions         //
@@ -98,7 +148,7 @@ uint64_t ghistory;
     pred = NOTTAKEN; \
     break; \
   case NW: \
-    pred = TAKEN; \
+    pred = NOTTAKEN; \
     break; \
   case TW: \
     pred = TAKEN; \
@@ -167,6 +217,161 @@ uint64_t ghistory;
     printf("Warning: Undefined state of entry in 3 bit BHT!\n"); \
     break; \
   }
+
+void init_tage()
+{
+  // allocate bimodal (2-bit saturating counters), init to weakly taken (WT)
+  tage_bimodal = (uint8_t *)malloc(TAGE_BIMODAL_SIZE * sizeof(uint8_t));
+  if (!tage_bimodal) { fprintf(stderr, "TAGE: bimodal malloc failed\n"); exit(1); }
+  for (int i = 0; i < TAGE_BIMODAL_SIZE; ++i) tage_bimodal[i] = WT;
+
+  // allocate tagged tables
+  tage_tables = (tage_entry_t **)malloc(TAGE_NUM_TAGGED * sizeof(tage_entry_t *));
+  if (!tage_tables) { fprintf(stderr, "TAGE: tables malloc failed\n"); exit(1); }
+  for (int t = 0; t < TAGE_NUM_TAGGED; ++t) {
+    tage_tables[t] = (tage_entry_t *)malloc(TAGE_TAGGED_SIZE * sizeof(tage_entry_t));
+    if (!tage_tables[t]) { fprintf(stderr, "TAGE: table[%d] malloc failed\n", t); exit(1); }
+    // initialize entries
+    for (int i = 0; i < TAGE_TAGGED_SIZE; ++i) {
+      tage_tables[t][i].tag = 0xFFFFu;         // invalid tag
+      tage_tables[t][i].ctr = TAGE_CTR_INIT;   // weakly taken
+      tage_tables[t][i].u = TAGE_U_INIT;
+    }
+  }
+
+  tage_ghist = 0;
+  tage_hist_mask = (1 << ghistoryBits) - 1; // reuse ghistoryBits as global history register width
+}
+
+uint8_t tage_predict(uint32_t pc)
+{
+  // bimodal index
+  uint32_t bim_idx = pc & (TAGE_BIMODAL_SIZE - 1);
+  uint8_t bim_pred;
+  PREDICT2b(tage_bimodal[bim_idx], bim_pred);
+
+  int provider = -1;
+  int alt = -1;
+  uint8_t provider_pred = bim_pred;
+  uint8_t alt_pred = bim_pred;
+
+  // search from longest history (highest table index) to shortest
+  for (int t = TAGE_NUM_TAGGED - 1; t >= 0; --t) {
+    uint32_t idx = tage_index(pc, tage_ghist, t);
+    uint16_t tag = tage_tag(pc, tage_ghist, t);
+    tage_entry_t *e = &tage_tables[t][idx];
+    if (e->tag == tag) {
+      uint8_t pred;
+      PREDICT3b(e->ctr, pred);
+      if (provider == -1) {
+        provider = t;
+        provider_pred = pred;
+      } else if (alt == -1) {
+        alt = t;
+        alt_pred = pred;
+      }
+    }
+  }
+
+  // if we have a provider, choose it; else use bimodal
+  if (provider != -1) return provider_pred;
+  return bim_pred;
+}
+
+void train_tage(uint32_t pc, uint8_t outcome)
+{
+  // bimodal index
+  uint32_t bim_idx = pc & (TAGE_BIMODAL_SIZE - 1);
+  uint8_t bim_pred;
+  PREDICT2b(tage_bimodal[bim_idx], bim_pred);
+
+  int provider = -1;
+  int alt = -1;
+  uint8_t provider_pred = bim_pred;
+  uint8_t alt_pred = bim_pred;
+
+  for (int t = TAGE_NUM_TAGGED - 1; t >= 0; --t) {
+    uint32_t idx = tage_index(pc, tage_ghist, t);
+    uint16_t tag = tage_tag(pc, tage_ghist, t);
+    tage_entry_t *e = &tage_tables[t][idx];
+    if (e->tag == tag) {
+      uint8_t pred;
+      PREDICT3b(e->ctr, pred);
+      if (provider == -1) {
+        provider = t;
+        provider_pred = pred;
+      } else if (alt == -1) {
+        alt = t;
+        alt_pred = pred;
+      }
+    }
+  }
+
+  // if provider exists, update its counter
+  if (provider != -1) {
+    uint32_t idx = tage_index(pc, tage_ghist, provider);
+    tage_entry_t *e = &tage_tables[provider][idx];
+    // update 3-bit saturating-like counter: keep in 0..7
+    COUNTERUPDATE3b(e->ctr, outcome);
+    // update useful bit: if provider predicted correctly and alternate predicted incorrectly, increase u
+    if (provider_pred == outcome && alt != -1 && alt_pred != outcome) {
+      COUNTERUPDATE2b(e->u, TAKEN);
+    }
+    // if provider wrong but alt correct, decrement u
+    if (provider_pred != outcome && alt != -1 && alt_pred == outcome) {
+      COUNTERUPDATE2b(e->u, NOTTAKEN);
+    }
+  } else {
+    // no provider: update bimodal only for now
+    COUNTERUPDATE2b(tage_bimodal[bim_idx], outcome);
+  }
+  // If provider did not exist and prediction was incorrect, allocate in a low-utility entry (simple allocation)
+  if (provider == -1) {
+    // try to allocate in one of the higher tables where an entry has u==0
+    for (int t = 0; t < TAGE_NUM_TAGGED; ++t) {
+      uint32_t idx = tage_index(pc, tage_ghist, t);
+      tage_entry_t *e = &tage_tables[t][idx];
+      if (e->u == 0) {
+        // allocate
+        e->tag = tage_tag(pc, tage_ghist, t);
+        e->ctr = TAGE_CTR_INIT + (outcome ? 1 : -1); // bias toward outcome
+        if (e->ctr > 7) e->ctr = 7;
+        if (e->ctr < 0) e->ctr = 0;
+        e->u = 0;
+        break;
+      } else {
+        // decay usefulness slowly
+        if (e->u > 0 && (rand() & 0x3F) == 0) e->u--;
+      }
+    }
+  }
+
+  // If provider existed, also update alternate or bimodal sometimes (helpful fallback)
+  if (provider != -1 && alt == -1) {
+    // update bimodal as alternate
+    if (outcome == TAKEN) {
+      if (tage_bimodal[bim_idx] < ST) tage_bimodal[bim_idx]++;
+    } else {
+      if (tage_bimodal[bim_idx] > SN) tage_bimodal[bim_idx]--;
+    }
+  }
+
+  // update global history (keep width limited by ghistoryBits)
+  tage_ghist = ((tage_ghist << 1) | (outcome & 1)) & ((1ULL << ghistoryBits) - 1);
+}
+
+// cleanup
+void cleanup_tage()
+{
+  if (tage_bimodal) { free(tage_bimodal); tage_bimodal = NULL; }
+  if (tage_tables) {
+    for (int t = 0; t < TAGE_NUM_TAGGED; ++t) {
+      if (tage_tables[t]) { free(tage_tables[t]); tage_tables[t] = NULL; }
+    }
+    free(tage_tables); tage_tables = NULL;
+  }
+}
+
 // Tournament functions
 void init_tournament()
 {
@@ -345,6 +550,7 @@ void init_predictor()
     init_tournament();
     break;
   case CUSTOM:
+  init_tage();
     break;
   default:
     break;
@@ -368,7 +574,7 @@ uint32_t make_prediction(uint32_t pc, uint32_t target, uint32_t direct)
   case TOURNAMENT:
     return tournament_predict(pc);
   case CUSTOM:
-    return NOTTAKEN;
+    return tage_predict(pc);
   default:
     break;
   }
@@ -395,7 +601,7 @@ void train_predictor(uint32_t pc, uint32_t target, uint32_t outcome, uint32_t co
     case TOURNAMENT:
       return train_tournament(pc, outcome);
     case CUSTOM:
-      return;
+      return train_tage(pc, outcome);
     default:
       break;
     }
